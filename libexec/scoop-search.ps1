@@ -4,13 +4,50 @@
 #
 # If used with [query], shows app names that match the query.
 # Without [query], shows all the available apps.
-param($query)
+param(
+    $query, 
+    [Switch]$RebuildCache
+)
 . "$psscriptroot\..\lib\core.ps1"
 . "$psscriptroot\..\lib\buckets.ps1"
 . "$psscriptroot\..\lib\manifest.ps1"
 . "$psscriptroot\..\lib\versions.ps1"
 
 reset_aliases
+
+function make_index(){
+    Get-LocalBucket | ForEach-Object {
+        $bucket = $_;
+        apps_in_bucket (Find-BucketDirectory $bucket) | ForEach-Object { 
+            $manifest = manifest $_ $bucket;
+            [array]$bin = extract_bin $manifest;
+            [PSCustomObject]@{
+                name = $_
+                bin = $bin
+                bucket = $bucket
+                version = $manifest.version
+            }
+        }
+    }
+}
+
+function extract_bin($manifest) {
+    [array]$bin = $manifest.bin ?? @()
+    $bin | ForEach-Object {
+        $exe, $alias, $args = $_;
+        $fname = Split-Path -Path $exe -leaf -ea stop
+        return $alias ?? (strip_ext $fname)
+    }
+}
+
+$search_index_path = "$cachedir\search_index.json";
+if(!(Test-Path $search_index_path) -or $RebuildCache) {
+    ensure $cachedir | Out-Null
+    $search_index = make_index;
+    ConvertTo-Json $search_index | New-Item -Force $search_index_path
+}
+
+$res = Get-Content -Path $search_index_path | ConvertFrom-Json
 
 function bin_match($manifest, $query) {
     if(!$manifest.bin) { return $false }
@@ -23,30 +60,6 @@ function bin_match($manifest, $query) {
     }
     $false
 }
-
-function search_bucket($bucket, $query) {
-    $apps = apps_in_bucket (Find-BucketDirectory $bucket) | ForEach-Object {
-        @{ name = $_ }
-    }
-
-    if($query) {
-        try {
-            $query = new-object regex $query, 'IgnoreCase'
-        } catch {
-            abort "Invalid regular expression: $($_.exception.innerexception.message)"
-        }
-
-        $apps = $apps | Where-Object {
-            if($_.name -match $query) { return $true }
-            $bin = bin_match (manifest $_.name $bucket) $query
-            if($bin) {
-                $_.bin = $bin; return $true;
-            }
-        }
-    }
-    $apps | ForEach-Object { $_.version = (latest_version $_.name $bucket); $_ }
-}
-
 function download_json($url) {
     $progressPreference = 'silentlycontinue'
     $result = invoke-webrequest $url -UseBasicParsing | Select-Object -exp content | convertfrom-json
@@ -96,14 +109,29 @@ function search_remotes($query) {
     }
 }
 
-Get-LocalBucket | ForEach-Object {
-    $res = search_bucket $_ $query
-    $local_results = $local_results -or $res
-    if($res) {
-        $name = "$_"
+if($query) {
+    try {
+        $query = new-object regex $query, 'IgnoreCase'
+    } catch {
+        abort "Invalid regular expression: $($_.exception.innerexception.message)"
+    }
 
-        Write-Host "'$name' bucket:"
-        $res | ForEach-Object {
+    $res = $res | Where-Object {
+        if($_.name -match $query) { return $true }
+        $_.bin = $_.bin | Where-Object { $_ -match $query }
+        if($_.bin) {
+            return $true;
+        }
+    }
+}
+
+if($res) {
+    $res | Group-Object -Property bucket | ForEach-Object {
+        $bucket = $_.Name;
+        $apps = $_.Group;
+
+        Write-Host "'$bucket' bucket:"
+        $apps | ForEach-Object {
             $item = "    $($_.name) ($($_.version))"
             if($_.bin) { $item += " --> includes '$($_.bin)'" }
             $item
@@ -112,7 +140,7 @@ Get-LocalBucket | ForEach-Object {
     }
 }
 
-if (!$local_results -and !(github_ratelimit_reached)) {
+if (!$res -and !(github_ratelimit_reached)) {
     $remote_results = search_remotes $query
     if(!$remote_results) { [console]::error.writeline("No matches found."); exit 1 }
     $remote_results
