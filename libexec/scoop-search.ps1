@@ -4,12 +4,14 @@
 #
 # If used with [query], shows app names that match the query.
 # Without [query], shows all the available apps.
-param($query)
-
-. "$PSScriptRoot\..\lib\manifest.ps1" # 'manifest'
-. "$PSScriptRoot\..\lib\versions.ps1" # 'Get-LatestVersion'
-
-$list = @()
+param(
+    $query,
+    [Switch]$RebuildCache
+)
+. "$psscriptroot\..\lib\core.ps1"
+. "$psscriptroot\..\lib\buckets.ps1"
+. "$psscriptroot\..\lib\manifest.ps1"
+. "$psscriptroot\..\lib\versions.ps1"
 
 try {
     $query = New-Object Regex $query, 'IgnoreCase'
@@ -17,11 +19,45 @@ try {
     abort "Invalid regular expression: $($_.Exception.InnerException.Message)"
 }
 
-$githubtoken = Get-GitHubToken
-$authheader = @{}
-if ($githubtoken) {
-    $authheader = @{'Authorization' = "token $githubtoken"}
+$RebuildCache = $false
+
+function make_index(){
+    Get-LocalBucket | ForEach-Object {
+        $bucket = $_;
+        apps_in_bucket (Find-BucketDirectory $bucket) | ForEach-Object {
+            $manifest = manifest $_ $bucket;
+            [array]$bin = extract_bin $manifest;
+            [PSCustomObject]@{
+                name = $_
+                bin = $bin
+                bucket = $bucket
+                version = $manifest.version
+            }
+        }
+    }
 }
+
+function extract_bin($manifest) {
+    [array]$bin = if (!$manifest.bin) {
+        $bin = @()
+    }else {
+        $manifest.bin
+    }
+    $bin | ForEach-Object {
+        $exe, $alias, $args = $_;
+        $fname = Split-Path $exe -Leaf -ErrorAction Stop
+        return $alias ?? (strip_ext $fname)
+    }
+}
+
+$search_index_path = "$cachedir\search_index.json";
+if(!(Test-Path $search_index_path) -or $RebuildCache) {
+    ensure $cachedir | Out-Null
+    $search_index = make_index
+    ConvertTo-Json $search_index | New-Item -Force $search_index_path | Out-Null
+}
+
+$search_index = Get-Content -Path $search_index_path | ConvertFrom-Json
 
 function bin_match($manifest, $query) {
     if (!$manifest.bin) { return $false }
@@ -35,38 +71,16 @@ function bin_match($manifest, $query) {
     if ($bins) { return $bins }
     else { return $false }
 }
-
-function search_bucket($bucket, $query) {
-    $apps = apps_in_bucket (Find-BucketDirectory $bucket) | ForEach-Object { @{ name = $_ } }
-
-    if ($query) {
-        $apps = $apps | Where-Object {
-            if ($_.name -match $query) { return $true }
-            $bin = bin_match (manifest $_.name $bucket) $query
-            if ($bin) {
-                $_.bin = $bin
-                return $true
-            }
-        }
-    }
-    $apps | ForEach-Object { $_.version = (Get-LatestVersion -AppName $_.name -Bucket $bucket); $_ }
-}
-
 function download_json($url) {
     $ProgressPreference = 'SilentlyContinue'
-    $result = Invoke-WebRequest $url -UseBasicParsing -Headers $authheader | Select-Object -ExpandProperty content | ConvertFrom-Json
+    $result = Invoke-WebRequest $url -UseBasicParsing | Select-Object -ExpandProperty content | ConvertFrom-Json
     $ProgressPreference = 'Continue'
     $result
 }
 
 function github_ratelimit_reached {
-    $api_link = 'https://api.github.com/rate_limit'
-    $ret = (download_json $api_link).rate.remaining -eq 0
-    if ($ret) {
-        Write-Host "GitHub API rate limit reached.
-Please try again later or configure your API token using 'scoop config gh_token <your token>'."
-    }
-    $ret
+    $api_link = "https://api.github.com/rate_limit"
+    (download_json $api_link).rate.remaining -eq 0
 }
 
 function search_remote($bucket, $query) {
@@ -76,8 +90,8 @@ function search_remote($bucket, $query) {
         $repo_name = $Matches[2]
         $api_link = "https://api.github.com/repos/$user/$repo_name/git/trees/HEAD?recursive=1"
         $result = download_json $api_link | Select-Object -ExpandProperty tree |
-            Where-Object -Value "^bucket/(.*$query.*)\.json$" -Property Path -Match |
-            ForEach-Object { $Matches[1] }
+            Where-Object { $_.path -match "(^(.*$query.*).json$)" } |
+            ForEach-Object { $Matches[2] }
     }
 
     $result
@@ -97,47 +111,48 @@ function search_remotes($query) {
     }
 
     $results | ForEach-Object {
-        $name = $_.bucket
-        $_.results | ForEach-Object {
-            $item = [ordered]@{}
-            $item.Name = $_
-            $item.Source = $name
-            $list += [PSCustomObject]$item
-        }
-    }
-
-    $list
-}
-
-Get-LocalBucket | ForEach-Object {
-    $res = search_bucket $_ $query
-    $local_results = $local_results -or $res
-    if ($res) {
-        $name = "$_"
-
-        $res | ForEach-Object {
-            $item = [ordered]@{}
-            $item.Name = $_.name
-            $item.Version = $_.version
-            $item.Source = $name
-            $item.Binaries = ""
-            if ($_.bin) { $item.Binaries = $_.bin -join ' | ' }
-            $list += [PSCustomObject]$item
-        }
+        "'$($_.bucket)' bucket:"
+        $_.results | ForEach-Object { "    $_" }
+        ""
     }
 }
 
-if ($list.Length -gt 0) {
-    Write-Host "Results from local buckets..."
-    $list
+$res = $search_index |
+    Where-Object {
+    if($_.name -match $query) { return $true }
+    $_.bin = $_.bin | Where-Object { $_ -match $query }
+    if($_.bin) {
+        return $true;
+    }
+} | ForEach-Object {
+    $item = [ordered]@{}
+    $item.Name = $_.name
+    $item.Version = $_.version
+    $item.Source = $_.bucket
+    $item.Binaries = ""
+    if ($_.bin) { $item.Binaries = $_.bin -join ' | ' }
+    [PSCustomObject]$item
 }
 
-if (!$local_results -and !(github_ratelimit_reached)) {
+if($res) {
+    $res
+    # $res | Group-Object -Property bucket | ForEach-Object {
+    #     $bucket = $_.Name;
+    #     $apps = $_.Group;
+
+    #     Write-Host "'$bucket' bucket:"
+    #     $apps | ForEach-Object {
+    #         $item = "    $($_.name) ($($_.version))"
+    #         if($_.bin) { $item += " --> includes '$($_.bin)'" }
+    #         $item
+    #     }
+    #     ""
+    # }
+}
+
+if (!$res -and !(github_ratelimit_reached)) {
     $remote_results = search_remotes $query
-    if (!$remote_results) {
-        warn "No matches found."
-        exit 1
-    }
+    if(!$remote_results) { [console]::error.writeline("No matches found."); exit 1 }
     $remote_results
 }
 
