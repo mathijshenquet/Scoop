@@ -40,11 +40,11 @@ function extract_bin($manifest) {
 function make_index(){
     Get-LocalBucket | ForEach-Object {
         $bucket = $_;
-        apps_in_bucket (Find-BucketDirectory $bucket) | ForEach-Object {
-            $manifest = manifest $_ $bucket;
+        Get-ChildItem (Find-BucketDirectory $bucket) -Filter '*.json' -Recurse | ForEach-Object {
+            $manifest = parse_json $_.FullName;
             [array]$bin = extract_bin $manifest;
             [PSCustomObject]@{
-                name = $_
+                name = $_.BaseName
                 bin = $bin
                 bucket = $bucket
                 version = $manifest.version

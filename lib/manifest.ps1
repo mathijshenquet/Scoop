@@ -1,13 +1,6 @@
 function manifest_path($app, $bucket) {
-    $out = (Get-Item "$(Find-BucketDirectory $bucket)\$(sanitary_path $app).json").FullName
-    # Write-Host $out
-    $out
+    (Get-ChildItem (Find-BucketDirectory $bucket) -Filter "$(sanitary_path $app).json" -Recurse).FullName
 }
-
-# function manifest_path($app, $bucket) {
-#     fullpath "$(Find-BucketDirectory $bucket)\$(sanitary_path $app).json"
-# }
-
 
 function parse_json($path) {
     if ($null -eq $path -or !(Test-Path $path)) { return $null }
